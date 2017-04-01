@@ -1,0 +1,180 @@
+# -*- coding: utf-8 -*-
+import scrapy
+import logging
+import os
+import urllib
+import pickle
+
+import settings
+
+from libs.plan_parser import PlanParser
+from libs.solution import match as solutionMatch
+from items import VpsItem
+from workstation.libs import cache
+from utils.src.cache import base, decorators, flag
+
+
+from scrapy.utils.trackref import object_ref
+class BroadSpider(object_ref):
+    def generate_spiders(cls):
+        pass
+
+
+cache_dir = os.path.join(base.WebsiteFileCache.cache_dir, 'plans')
+planCache = base.WebsiteFileCache(cache_dir=cache_dir, file_mode='b')
+logger = logging.getLogger('plan')
+flagOfGAUU = flag.Base("GB_attr_unaware_urls")
+
+
+class PlanBroadSpider(BroadSpider):
+    name = 'plan' # spider without name would not be loaded by iter_broadspider_classes
+
+    def generate_spiders(self):
+        urls = self.get_vps_providers_urls()
+        # urls = ['https://www.vps.net/']
+        logging.info('got %d urls: %r', len(urls), urls)
+        for url in urls:
+            netloc = urllib.parse.urlparse(url).netloc
+            # capitalize and remove dots
+            spiderName = ''.join(map(lambda e: e.capitalize(), netloc.split('.')))
+            # remove non-alpha-num chars
+            spiderName = ''.join(filter(lambda e: e.isalnum(), spiderName))
+            spiderClsName = spiderName + 'Spider'
+            spiderCls = type(spiderClsName, (GenericSpider,), {
+                'name': spiderName, 
+                'allowed_domains': [netloc],
+                '_start_urls': [url],
+            })
+            globals()[spiderClsName] = spiderCls
+            yield spiderCls
+
+    def get_vps_providers_urls(self):
+        # return ['https://www.ovh.com/us/vps/']
+
+        r = cache.connect()
+        urls = r.lrange(cache.keys.vps_providers_urls, 0, -1)
+        urls = list(map(lambda e: e.decode('utf8'), urls))
+        return urls
+
+
+class GenericSpider(scrapy.Spider):
+    # name = "generic"
+    allowed_domains = []
+    visited_urls = {}
+
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        spider = super(GenericSpider, cls).from_crawler(crawler, *args, **kwargs)
+        spider.stats = crawler.stats
+        spider.stats.set_value('spider/name', spider.name)
+        spider.stats.set_value('spider/start_url', spider._start_urls)
+        spider.stats.set_value('spider/requests_urls', 0)
+        spider.stats.set_value('spider/parsed_page', 0)
+        spider.stats.set_value('spider/planed_page', 0)
+        # spider.stats.set_value('spider/failed_GB_pages', [])
+        return spider
+
+    """
+    def save_to_file(self, step_name, resp, pp):
+        root = 'logs'
+        title = resp.css('title')[0].xpath('text()').extract()[0]
+        netloc = urllib.parse.urlparse(resp.url).netloc
+        name = ''.join([c for c in title if c.isalnum() or c.isspace()])[:30]
+        name = netloc + '-' + name.replace(' ', '_')
+        dir_path = os.path.join(root, step_name)
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path)
+
+        file_path = os.path.join(dir_path, name) + '.htm'
+        with open(file_path, 'w') as fp:
+            fp.write(str(pp.soup))
+    """
+
+    def start_requests(self):
+        # urls = self.get_vps_providers_urls()
+        # urls = self.get_vps_providers_urls()
+        # logging.info('got %d urls: %r', len(urls), urls)
+        for url in self._start_urls:
+            if not self.resquest_filter(url):
+                continue
+            # meta = {'proxy': 'http://127.0.0.1:8888'}
+            meta = {}
+            yield scrapy.Request(url=url, callback=self.parse, meta=meta)
+
+    @decorators.Memorize(decorators.PositionSelector(1), planCache)
+    def extract_plan(self, url, text):
+        pp = PlanParser(text)
+        urlOfFailedGBAttr = ''
+        try:
+            gb_attrs = pp.get_GB_attrs()
+        except:
+            gb_attrs = []
+        if len(gb_attrs) == 0:
+            return None, urlOfFailedGBAttr
+        urlOfFailedGBAttr = url
+
+        try:
+            plan_attrs = pp.get_plan_attrs(gb_attrs)
+            plans = pp.get_plans(plan_attrs)
+            if plans:
+                urlOfFailedGBAttr = ''
+        except Exception as e:
+            return None, urlOfFailedGBAttr
+        return plans, urlOfFailedGBAttr
+
+    def parse(self, response):
+        self.stats.inc_value('spider/parsed_page')
+        content_type = response.headers.get('Content-Type').decode('utf8')
+        if not content_type.startswith('text/html'):
+            # avoid image type
+            logger.debug('%s is not text/html', response)
+            return
+
+        # 只处理小于 200KB 的页面
+        if len(response.body) <= 204800:
+            plans = solutionMatch(response.url, response.text)
+            if not plans:
+                plans, urlOfFailedGBAttr = self.extract_plan(response.url, response.text)
+                if urlOfFailedGBAttr:
+                    # self.stats.get_value('spider/failed_GB_pages')
+                    logger.info("Notice this link (failed on plan parsing but contains GB Attrs): %s", urlOfFailedGBAttr)
+                elif not plans:
+                    'this url does not contain any plans, no need to request next time'
+                    logger.debug("Spotting link (failed on GB attr detecting): %s", response.url)
+                    flagOfGAUU.set(response.url, 1)
+
+            if plans:
+                self.stats.inc_value('spider/planed_page')
+                yield VpsItem(resp=response, plans=plans)
+
+        for url in response.css("a::attr(href)").extract():
+            next_page = response.urljoin(url)
+            if not next_page.startswith('http'):
+                continue
+            if not self.resquest_filter(next_page):
+                continue
+            # logger.debug('----- %s', next_page)
+            self.stats.inc_value('spider/requests_urls')
+            yield scrapy.Request(url=next_page, callback=self.parse)
+
+    def resquest_filter(self, url):
+        if self.visited_urls.get(url):
+            return False
+        ext = os.path.splitext(url)
+        if ext in ('.jpg', '.png', '.gif', '.pdf', '.jpeg'):
+            return False
+        self.visited_urls[url] = True
+
+        """
+        # It's buggy, because the start url will hit this flag, that cause no more requests
+        r = flagOfGAUU.get(url)
+        if r:
+            logger.debug("Ignoring url (hit flag of GAUU): %s", url)
+            return False
+        """
+        return True
+
+    def close_spider(self):
+        # urls = self.stats.get_value('spider/failed_GB_pages')
+        # self.stats.set_value('spider/failed_GB_pages', ','.join(urls))
+        pass

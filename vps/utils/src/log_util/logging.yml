@@ -1,0 +1,40 @@
+version: 1
+disable_existing_loggers: False
+
+filters:
+    myfilter:
+        '()': utils.src.log_util.ContextFilter
+formatters:
+    tofile:
+        format: "%(asctime)s|%(lvlname)s|%(name)s:%(funcName)s|> %(message)s"
+    tocons:
+        format: "%(asctime)s|%(lvlname)s|> %(message)s"
+        datefmt: '%H:%M:%S'
+        # format: %H:%M:%S}
+
+handlers:
+    console:
+        # class: logging.StreamHandler
+        class: utils.src.log_util.ConsoleHandler
+        level: DEBUG
+        formatter: tocons
+        stream: ext://sys.stdout
+        filters: [myfilter]
+
+    file_handler:
+        # class: logging.handlers.RotatingFileHandler
+        class: utils.src.log_util.DebugRotatingFileHandler
+        level: DEBUG
+        formatter: tofile
+        filename: logs/routines.log
+        # maxBytes: 10485760 # 10MB
+        backupCount: 20
+        encoding: utf8
+        filters: [myfilter]
+
+
+root:
+    level: DEBUG
+    handlers: [console, file_handler]
+
+

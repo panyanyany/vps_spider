@@ -1,0 +1,189 @@
+# -*- coding: utf-8 -*-
+import scrapy
+import logging
+import os
+import urllib
+
+from twisted.internet import reactor
+from scrapy.crawler import CrawlerProcess, CrawlerRunner
+from scrapy.settings import Settings
+from scrapy.utils.project import get_project_settings
+
+from vps import settings
+from vps.libs.plan_parser import PlanParser
+from vps.items import VpsItem
+from workstation.libs import cache
+
+
+logger = logging.getLogger(__name__)
+
+
+class PlanSpider(scrapy.Spider):
+    name = 'plan'
+    allowed_domains = []
+
+    @staticmethod
+    def get_vps_providers_urls():
+        # return ['https://www.ovh.com/us/vps/']
+
+        r = cache.connect()
+        urls = r.lrange(cache.keys.vps_providers_urls, 0, -1)
+        urls = list(map(lambda e: e.decode('utf8'), urls))
+        return urls
+
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        logger.debug('PlanSpider - from %s, attrs: %s', cls.name, cls.allowed_domains)
+        spider = super(PlanSpider, cls).from_crawler(crawler, *args, **kwargs)
+        spider.associated_urls = {}
+        spider.associate_keys = {}
+
+        return spider
+
+    @classmethod
+    def gen_plan_spider(cls, url):
+        host = urllib.parse.urlparse(url).netloc
+        spider_name = host.lstrip('www.').title()
+        spider_name = ''.join([c for c in spider_name if c.isalnum()])
+        NewSpider = type(spider_name, (GenericSpider,), {
+            'allowed_domains': [host],
+            'start_urls': [url],
+            'name': host,
+        })
+        return NewSpider
+
+
+class GenericSpider(scrapy.Spider):
+    name = "generic"
+    allowed_domains = []
+    got_plan = False
+    visited_urls = {}
+
+    def get_host(self, url):
+        up = urllib.parse.urlparse(url)
+        return up.netloc
+
+    def associate(self, start_url, url):
+        host = self.get_host(start_url)
+        self.associated_urls[url] = start_url
+
+    def inc_value(self, url):
+        start_url = self.associated_urls.get(url)
+        if not start_url:
+            logging.warn('no matched start_url with %s', url)
+        else:
+            self.crawler.stats.inc_value('plan/' + start_url)
+
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        logger.debug('GenericSpider - from %s, attrs: %s', cls.name, cls.allowed_domains)
+        spider = super(GenericSpider, cls).from_crawler(crawler, *args, **kwargs)
+        spider.associated_urls = {}
+        spider.associate_keys = {}
+        return spider
+
+    def save_to_file(self, step_name, resp, pp):
+        root = 'logs'
+        title = resp.css('title')[0].xpath('text()').extract()[0]
+        netloc = urllib.parse.urlparse(resp.url).netloc
+        name = ''.join([c for c in title if c.isalnum() or c.isspace()])[:30]
+        name = netloc + '-' + name.replace(' ', '_')
+        dir_path = os.path.join(root, step_name)
+        if not os.path.exists(dir_path):
+            os.makedirs(dir_path)
+
+        file_path = os.path.join(dir_path, name) + '.htm'
+        with open(file_path, 'w') as fp:
+            fp.write(str(pp.soup))
+
+    def set_associate_key(self, url):
+        self.crawler.stats.set_value('plan/' + self.get_host(url), 0)
+        self.associate_keys[url] = 1
+
+    def start_requests(self):
+        logger.debug('Spider:%s, crawling %s', self.__class__.__name__, self.start_urls)
+        for url in self.start_urls:
+            if not self.resquest_filter(url):
+                continue
+            self.set_associate_key(url)
+            # meta = {'proxy': 'http://127.0.0.1:8888'}
+            meta = {}
+            yield scrapy.Request(url=url, callback=self.parse, meta=meta)
+
+    def extract_plan(self, resp):
+        body = resp.text
+        pp = PlanParser(body)
+        gb_attrs = pp.get_GB_attrs()
+        self.save_to_file('get_GB_attrs', resp, pp)
+        if len(gb_attrs) == 0:
+            return None
+
+        try:
+            plan_attrs = pp.get_plan_attrs(gb_attrs)
+            self.save_to_file('get_plan_attrs', resp, pp)
+            plans = pp.get_plans(plan_attrs)
+            self.save_to_file('get_plans', resp, pp)
+        except Exception as e:
+            logging.info("failed to parse plan but got %d GB_attrs", len(gb_attrs))
+            self.save_underlying_plan_url(resp.url)
+            raise
+        return plans
+
+    def save_underlying_plan_url(self, url):
+        """store for parsing by hand"""
+        return None
+
+    def save_plan_url(self, url):
+        """store as known url so that no need to parse other urls under same domain"""
+        return None
+
+    def parse(self, response):
+        content_type = response.headers.get('Content-Type').decode('utf8')
+        if not content_type.startswith('text/html'):
+            # avoid image type
+            return
+
+        # 只处理小于 200KB 的页面
+        if len(response.body) <= 204800:
+            plans = self.extract_plan(response)
+
+            if plans:
+                self.save_plan_url(response.url)
+                yield VpsItem(resp=response, plans=plans)
+
+        for url in response.css("a::attr(href)").extract():
+            next_page = response.urljoin(url)
+            if not next_page.startswith('http'):
+                continue
+            if not self.resquest_filter(next_page):
+                continue
+            yield scrapy.Request(url=next_page, callback=self.parse)
+
+    def resquest_filter(self, url):
+        if self.visited_urls.get(url):
+            return False
+        ext = os.path.splitext(url)
+        if ext in ('.jpg', '.png', '.gif', '.pdf', '.jpeg'):
+            return False
+        self.visited_urls[url] = True
+        return True
+
+"""
+urls = PlanSpider.get_vps_providers_urls()
+urls = ['https://google.com', 'http://www.baidu.com']
+crawler2 = CrawlerProcess()
+for url in urls:
+    NewSpider = PlanSpider.gen_plan_spider(url)
+    crawler2.crawl(NewSpider)
+crawler2.start()
+"""
+
+urls = PlanSpider.get_vps_providers_urls()
+print(urls)
+runner = CrawlerRunner(get_project_settings())
+for url in urls:
+    NewSpider = PlanSpider.gen_plan_spider(url)
+    runner.crawl(NewSpider)
+d = runner.join()
+d.addBoth(lambda _: reactor.stop())
+reactor.run()
